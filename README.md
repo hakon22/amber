@@ -29,12 +29,14 @@
   - `PROXY_USER`, `PROXY_PASS`, `PROXY_HOST` — опционально, настройки SOCKS‑прокси для Telegram.
 - **Режимы запуска**
   - `NODE_ENV` — `development` или `production` (определяет polling / webhook режим).
-  - `PORT` — порт HTTP‑сервера Express (по умолчанию `3010`).
+  - `PORT` — порт HTTP‑сервера Express (по умолчанию `3011`).
 - **PostgreSQL**
-  - `DB` — режим подключения: обычно `LOCAL`.
+  - `DB` — режим подключения: `LOCAL` или `HOST`.
   - `DB_LOCAL` / `DB_HOST` — имя базы для локального и удалённого подключения.
   - `USER_DB_LOCAL` / `PASSWORD_DB_LOCAL` — логин/пароль для локальной БД.
   - `USER_DB_HOST` / `PASSWORD_DB_HOST` — логин/пароль для удалённой БД.
+- **Docker (production)**
+  - `DOCKER_USERNAME` — имя пользователя Docker Hub (образ собирается как `${DOCKER_USERNAME}/amber-bot:latest`).
 
 Для production‑деплоя через Docker переменные задаются в `.env` на сервере (через `env_file` в docker-compose).
 
@@ -42,11 +44,16 @@
 
 ## Скрипты npm
 
-- `npm run build` — компиляция TypeScript в `dist`.
+- `npm run build` — компиляция TypeScript в `dist` (tsc + tsc-alias).
 - `npm run start:bot:dev` — запуск бота в dev‑режиме (polling, `NODE_ENV=development`, через `tsx`).
-- `npm run start:bot:prod` — запуск собранного бота из `dist` (используется в production‑образе Docker).
-- `npm run lint` — запуск ESLint по `src`.
-- `npm run migration:run` — применение миграций БД (в режиме development).
+- `npm run start:bot:prod` — запуск собранного бота (production, `node src/bot.js`; в Docker образе код лежит в `src` после копирования из `dist`).
+- `npm run start:bot:docker:dev` — запуск бота в dev‑режиме внутри контейнера (собранный код, переменная `IS_DOCKER=TRUE`).
+- `npm run lint` — проверка кода ESLint по `src`; автоисправление: `npm run lint -- --fix`.
+- `npm run migration:create` — создание заготовки миграции (TypeORM).
+- `npm run migration:create:name` — создание миграции с именем через хелпер.
+- `npm run migration:run` — применение миграций (локальная БД, `DB=LOCAL`).
+- `npm run migration:run:prod` — применение миграций на production (`DB=HOST`, используется в Docker).
+- `npm run migration:revert` — откат последней миграции.
 
 ---
 
@@ -80,10 +87,17 @@ npm run start:bot:dev
 
 ### Production
 
-Образ — многоэтапная сборка (зависимости → сборка TypeScript → финальный образ только с `dist` и зависимостями):
+Образ — многоэтапная сборка (зависимости → сборка TypeScript → финальный образ с `dist/src` в `/app/src`, только нужные файлы):
 
 ```bash
 docker build -t amber-bot .
+```
+
+Для пуша в Docker Hub (например, для CI):
+
+```bash
+docker build -t ${DOCKER_USERNAME}/amber-bot:latest .
+docker push ${DOCKER_USERNAME}/amber-bot:latest
 ```
 
 Запуск через `docker-compose.prod.yml`:
@@ -92,28 +106,45 @@ docker build -t amber-bot .
 docker compose -f docker-compose.prod.yml up -d
 ```
 
+В compose два сервиса:
+
+- **migrations** — один раз выполняет `migration:run:prod`, затем завершается.
+- **bot** — основной процесс (`start:bot:prod`), зависит от `migrations` и стартует после них.
+
 Ожидается, что:
 
-- переменные окружения заданы в `.env` рядом с `docker-compose.prod.yml`;
+- в `.env` заданы переменные окружения и `DOCKER_USERNAME` для имени образа;
 - логи пишутся в `/srv/logs` на хосте (volume в compose‑файле);
-- в образе по умолчанию выполняется `npm run start:bot:prod`.
+- приложение слушает порт **3011**.
 
 ### Development
 
-Образ для разработки (polling, без сборки — запуск через `tsx`):
+Сборка и запуск через `docker-compose.dev.yml`:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+```
+
+Образ собирается из `Dockerfile.dev` (сборка в образе, в контейнере запускается `start:bot:docker:dev`). Порт **3011**, логи — в указанный каталог на хосте (в примере `C:/srv/logs`).
+
+Сборка dev‑образа вручную:
 
 ```bash
 docker build -f Dockerfile.dev -t amber-bot:dev .
-docker run --rm -it --env-file .env -v /srv/logs:/srv/logs amber-bot:dev
+docker run --rm -it --env-file .env -v /srv/logs:/srv/logs -p 3011:3011 amber-bot:dev start:bot:docker:dev
 ```
 
-Для hot-reload можно монтировать исходники:
+---
 
-```bash
-docker run --rm -it --env-file .env -v "$(pwd)/src:/app/src" -v /srv/logs:/srv/logs amber-bot:dev
-```
+## Деплой (GitHub Actions)
 
-(На Windows в Git Bash путь к проекту: `-v "$(pwd)/src:/app/src"` или укажите полный путь к `src`.)
+При пуше в ветку `production` (или по ручному запуску workflow) выполняется:
+
+1. Сборка Docker‑образа и push в Docker Hub (`DOCKER_USERNAME/amber-bot:latest`).
+2. Копирование `docker-compose.prod.yml` на сервер.
+3. На сервере: `docker pull`, `docker compose down`, `docker compose up -d`.
+
+Необходимые секреты репозитория: `DOCKER_USERNAME`, `DOCKER_TOKEN`, `SERVER_HOST`, `SERVER_USER`, `AM_PROJECTS_SSH_PRIVATE_KEY`.
 
 ---
 
