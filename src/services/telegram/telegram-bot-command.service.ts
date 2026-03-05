@@ -1,7 +1,6 @@
 import { Container, Singleton } from 'typescript-ioc';
 import axios from 'axios';
-import { Markup } from 'telegraf';
-import type { Telegraf, Context } from 'telegraf';
+import { Markup, type Telegraf, type Context } from 'telegraf';
 import { In } from 'typeorm';
 
 import { TelegramBotService } from '@/services/telegram/telegram-bot.service';
@@ -345,7 +344,7 @@ export class TelegramBotCommandService extends BaseService {
       try {
         await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
       } catch (e) {
-        // если не удалось отредактировать (например, сообщение уже изменено) — просто игнорируем
+        this.loggerService.error(this.TAG, 'Failed to edit message reply markup', e);
       }
 
       if (rating === 'NOT_USEFUL') {
@@ -786,10 +785,10 @@ export class TelegramBotCommandService extends BaseService {
     const proxyAgent = this.telegramBotService.getSocksProxyAgent();
     const axiosConfig = proxyAgent
       ? {
-          httpAgent: proxyAgent,
-          httpsAgent: proxyAgent,
-          responseType: 'arraybuffer' as const,
-        }
+        httpAgent: proxyAgent,
+        httpsAgent: proxyAgent,
+        responseType: 'arraybuffer' as const,
+      }
       : { responseType: 'arraybuffer' as const };
 
     const response = await axios.get<ArrayBuffer>(url, axiosConfig);
