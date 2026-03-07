@@ -1,7 +1,7 @@
 import { Container, Singleton } from 'typescript-ioc';
+import { In } from 'typeorm';
 import axios from 'axios';
 import { Markup, type Telegraf, type Context } from 'telegraf';
-import { In } from 'typeorm';
 
 import { TelegramBotService } from '@/services/telegram/telegram-bot.service';
 import { TelegramService } from '@/services/telegram/telegram.service';
