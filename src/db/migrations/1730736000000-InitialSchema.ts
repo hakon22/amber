@@ -7,7 +7,6 @@ export class InitialSchema1730736000000 implements MigrationInterface {
 
   public async up(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.query(`CREATE SCHEMA IF NOT EXISTS "${SCHEMA}"`);
-    await queryRunner.query(`CREATE EXTENSION IF NOT EXISTS vector`);
 
     await queryRunner.query(`
       CREATE TYPE "${SCHEMA}"."agent_type_enum" AS ENUM ('MISTRAL', 'OPENAI')
