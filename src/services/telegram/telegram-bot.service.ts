@@ -1,7 +1,7 @@
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { Telegraf, Input } from 'telegraf';
 import { Container, Singleton } from 'typescript-ioc';
-import type { ExtraReplyMessage, MediaGroup } from 'telegraf/typings/telegram-types';
+import type { ExtraReplyMessage, MediaGroup, ExtraEditMessageText } from 'telegraf/typings/telegram-types';
 import type { Context } from 'telegraf';
 
 import { LoggerService } from '@/services/app/logger.service';
@@ -31,10 +31,20 @@ export class TelegramBotService {
         }
         : {});
 
-      await this.bot.telegram.setMyCommands([{
-        command: 'start',
-        description: '🔃 Запуск бота',
-      }]);
+      await this.bot.telegram.setMyCommands([
+        {
+          command: 'start',
+          description: '🔃 Запуск бота',
+        },
+        {
+          command: 'profile',
+          description: '🚗 Профиль автомобиля',
+        },
+        {
+          command: 'stop',
+          description: '⛔ Остановить ответ',
+        },
+      ]);
 
       this.loggerService.info(this.TAG, 'Telegram bot initialized');
     } catch (e) {
@@ -81,10 +91,24 @@ export class TelegramBotService {
       if (mime.startsWith('image/')) {
         return this.getBot().telegram.sendPhoto(telegramId, inputFile, { parse_mode: 'HTML' });
       }
+      if (mime.startsWith('video/')) {
+        return this.getBot().telegram.sendVideo(telegramId, inputFile, { parse_mode: 'HTML' });
+      }
       return this.getBot().telegram.sendDocument(telegramId, inputFile, { parse_mode: 'HTML' });
     } catch (e) {
       this.loggerService.error(this.TAG, `Ошибка отправки файла на telegramId ${telegramId}`, e);
       throw e;
+    }
+  };
+
+  public editMessage = async (text: string, telegramId: string, messageId: number, options?: ExtraEditMessageText) => {
+    try {
+      return this.getBot().telegram.editMessageText(telegramId, messageId, undefined, text, {
+        parse_mode: 'HTML',
+        ...options,
+      });
+    } catch {
+      this.loggerService.debug(this.TAG, 'Сообщение могло быть удалено или текст не изменился');
     }
   };
 }

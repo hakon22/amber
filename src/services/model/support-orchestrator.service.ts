@@ -13,6 +13,7 @@ import { UserEntity } from '@/db/entities/user.entity';
 interface OrchestratorResult {
   answer: string;
   knowledgeIds: number[];
+  usedKnowledgeIds: number[];
   confidence: number;
   historyId?: number;
   /** true, если бот задал уточняющий вопрос и ждёт ответа */
@@ -50,6 +51,7 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       return {
         answer: fallback,
         knowledgeIds: [],
+        usedKnowledgeIds: [],
         confidence: 0,
       };
     }
@@ -77,6 +79,7 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       return {
         answer: clarificationQuestion,
         knowledgeIds: [],
+        usedKnowledgeIds: [],
         confidence,
         isClarification: true,
       };
@@ -90,19 +93,36 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       await state.save();
     }
 
-    const formattedAnswer = await this.runFormattingAgent(chatAgent, question, knowledges, telegramId, fileContents, imageBase64List);
+    const { answer: formattedAnswer, usedKnowledgeIds } = await this.runFormattingAgent(
+      chatAgent,
+      question,
+      knowledges,
+      telegramId,
+      fileContents,
+      imageBase64List,
+    );
 
     const knowledgeIds = knowledges.map(({ id }) => id);
+    const validKnowledgeIdSet = new Set<number>(knowledgeIds);
+    const normalizedUsedKnowledgeIds = usedKnowledgeIds.filter((knowledgeId) => validKnowledgeIdSet.has(knowledgeId));
 
     const responseTimeMs = Date.now() - startedAt;
 
-    const historyId = await this.saveHistory(telegramId, question, formattedAnswer, confidence, knowledgeIds, responseTimeMs);
+    const historyId = await this.saveHistory(
+      telegramId,
+      question,
+      formattedAnswer,
+      confidence,
+      normalizedUsedKnowledgeIds,
+      responseTimeMs,
+    );
 
     await this.updateSummary(telegramId, question, formattedAnswer);
 
     return {
       answer: formattedAnswer,
       knowledgeIds,
+      usedKnowledgeIds: normalizedUsedKnowledgeIds,
       confidence,
       historyId,
     };
@@ -129,6 +149,7 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       return '';
     }
     let out = text
+      // eslint-disable-next-line no-control-regex
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
       .replace(/\uFFFD/g, ' ');
     if (maxLength > 0 && out.length > maxLength) {
@@ -165,13 +186,13 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       const hasImages = Array.isArray(imageBase64List) && imageBase64List.length > 0;
       const humanContent = hasImages
         ? [
-            textBlock,
-            ...imageBase64List.map((base64) => ({
-              type: 'image_url' as const,
-              // eslint-disable-next-line camelcase
-              image_url: { url: `data:image/jpeg;base64,${base64}` },
-            })),
-          ]
+          textBlock,
+          ...imageBase64List.map((base64) => ({
+            type: 'image_url' as const,
+             
+            image_url: { url: `data:image/jpeg;base64,${base64}` },
+          })),
+        ]
         : [textBlock];
 
       const messages = [
@@ -194,7 +215,7 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
     telegramId: string,
     fileContents?: string[],
     imageBase64List?: string[],
-  ): Promise<string> => {
+  ): Promise<{ answer: string; usedKnowledgeIds: number[]; }> => {
     try {
       const model = this.getChatModel(agent);
 
@@ -212,7 +233,7 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
 
       const [state, user] = await Promise.all([
         TelegramDialogStateEntity.findOne({ where: { telegramId } }),
-        UserEntity.findOne({ where: { telegramId } })
+        UserEntity.findOne({ where: { telegramId } }),
       ]);
       const summary: string | undefined = state?.data?.summary;
 
@@ -234,6 +255,11 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
         'Язык ответа: русский.',
         safeProfile ? `Профиль клиента: ${safeProfile}` : '',
         safeSummary ? `Краткая история предыдущего диалога: ${safeSummary}` : '',
+        '',
+        'В конце ответа отдельной строкой добавь:',
+        'USED_KNOWLEDGE_IDS: список id знаний, которые реально использованы при формировании ответа.',
+        'Если знания не были использованы, верни: USED_KNOWLEDGE_IDS: []',
+        'Под USED_KNOWLEDGE_IDS: используем ТОЛЬКО числа (например, USED_KNOWLEDGE_IDS: 1,2,5 или USED_KNOWLEDGE_IDS: [1, 2, 5]).',
       ].filter(Boolean).join('\n');
 
       const textParts = [
@@ -255,13 +281,13 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       const hasImages = Array.isArray(imageBase64List) && imageBase64List.length > 0;
       const humanContent = hasImages
         ? [
-            { type: 'text' as const, text: textParts.join('\n') },
-            ...imageBase64List.map((base64) => ({
-              type: 'image_url' as const,
-              // eslint-disable-next-line camelcase
-              image_url: { url: `data:image/jpeg;base64,${base64}` },
-            })),
-          ]
+          { type: 'text' as const, text: textParts.join('\n') },
+          ...imageBase64List.map((base64) => ({
+            type: 'image_url' as const,
+             
+            image_url: { url: `data:image/jpeg;base64,${base64}` },
+          })),
+        ]
         : textParts.join('\n');
 
       const messages = [
@@ -270,11 +296,45 @@ export class SupportAgentOrchestratorService extends ModelBaseService {
       ];
 
       const res = await model.invoke(messages);
-      return res.text?.trim() || 'Сейчас нет достаточной информации для точного ответа.';
+
+      const rawText = res.text?.trim() || '';
+      const validKnowledgeIdList = knowledges.map((knowledge) => knowledge.id);
+      const usedKnowledgeIds = this.extractUsedKnowledgeIds(rawText, validKnowledgeIdList);
+      const answerText = rawText
+        ? rawText.replace(/USED_KNOWLEDGE_IDS:\s*.*$/im, '').trim()
+        : '';
+
+      return {
+        answer: answerText || rawText || 'Сейчас нет достаточной информации для точного ответа.',
+        usedKnowledgeIds,
+      };
     } catch (e) {
       this.loggerService.error(this.TAG, 'Formatting agent error', e);
-      return 'Произошла ошибка при формировании ответа. Попробуйте повторить запрос позже.';
+      return {
+        answer: 'Произошла ошибка при формировании ответа. Попробуйте повторить запрос позже.',
+        usedKnowledgeIds: [],
+      };
     }
+  };
+
+  private extractUsedKnowledgeIds = (rawText: string, validKnowledgeIdList: number[]): number[] => {
+    if (!rawText) {
+      return [];
+    }
+
+    const validKnowledgeIdSet = new Set<number>(validKnowledgeIdList);
+    const match = rawText.match(/USED_KNOWLEDGE_IDS:\s*(.*)$/im);
+    if (!match) {
+      return [];
+    }
+
+    const value = match[1] ?? '';
+    const numberCandidates = value.match(/\d+/g) ?? [];
+    const parsedKnowledgeIdList = numberCandidates
+      .map((knowledgeIdCandidate) => Number.parseInt(knowledgeIdCandidate, 10))
+      .filter((knowledgeId) => !Number.isNaN(knowledgeId));
+
+    return parsedKnowledgeIdList.filter((knowledgeId) => validKnowledgeIdSet.has(knowledgeId));
   };
 
   private setClarificationState = async (telegramId: string, originalQuestion: string): Promise<void> => {

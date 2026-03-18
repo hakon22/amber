@@ -1,5 +1,5 @@
 import { Container, Singleton } from 'typescript-ioc';
-import type { ExtraReplyMessage } from 'telegraf/typings/telegram-types';
+import type { ExtraReplyMessage, ExtraEditMessageText } from 'telegraf/typings/telegram-types';
 import type { Request, Response } from 'express';
 
 import { UserEntity } from '@/db/entities/user.entity';
@@ -37,6 +37,7 @@ export class TelegramService {
       '• Задавать любые вопросы по обслуживанию и эксплуатации автомобиля.',
       '• Заполнить профиль автомобиля командой /profile, чтобы ответы учитывали марку, год и пробег.',
       '• Получать более точные рекомендации с учётом данных твоего авто.',
+      '• Прервать долгий ответ: кнопка «Остановить» под спиннером или команда /stop.',
       '',
       'Просто напиши свой вопрос в чат, а чтобы настроить профиль — отправь команду /profile.',
     ];
@@ -64,6 +65,11 @@ export class TelegramService {
 
       await this.sendMessage(message, adminUser.telegramId, options);
     }
+  };
+
+  public editMessage = async (message: string | string[], telegramId: string, messageId: number, options?: ExtraEditMessageText) => {
+    const text = this.serializeText(message);
+    return this.telegramBotService.editMessage(text, telegramId, messageId, options);
   };
 
   private serializeText = (message: string | string[]) => Array.isArray(message) ? message.reduce((acc, field) => acc += `${field}\n`, '') : message;

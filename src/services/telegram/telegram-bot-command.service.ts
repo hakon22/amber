@@ -15,6 +15,9 @@ import { SupportAgentOrchestratorService } from '@/services/model/support-orches
 import { UserEntity } from '@/db/entities/user.entity';
 import { ResponseHistoryEntity, type ResponseRating } from '@/db/entities/response-history.entity';
 import { BaseService } from '@/services/app/base.service';
+import { YandexVoiceRecognitionService } from '@/services/voice/yandex-voice-recognition.service';
+
+const DOTS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 @Singleton
 export class TelegramBotCommandService extends BaseService {
@@ -29,6 +32,8 @@ export class TelegramBotCommandService extends BaseService {
   private readonly supportOrchestratorService = Container.get(SupportAgentOrchestratorService);
 
   private readonly fileParserService = Container.get(FileParserService);
+
+  private readonly yandexVoiceRecognitionService = Container.get(YandexVoiceRecognitionService);
 
   private readonly MAX_ERROR_MESSAGE_LENGTH = 4000;
 
@@ -46,6 +51,11 @@ export class TelegramBotCommandService extends BaseService {
 
   private readonly TAG = 'TelegramBotCommandService';
 
+  /** telegramId → отмена текущего ответа поддержки */
+  private readonly cancelAnswerByTelegramId = new Map<string, () => void>();
+
+  private readonly CANCELLED_ANSWER_MESSAGE = '⛔ Ответ остановлен.';
+
   public register = (bot: Telegraf<Context>): void => {
     bot.start(async (ctx) => {
       const telegramId = ctx.from.id.toString();
@@ -59,6 +69,19 @@ export class TelegramBotCommandService extends BaseService {
           telegramId,
           { reply_markup: this.getAdminMainKeyboard().reply_markup },
         );
+      }
+    });
+
+    bot.command('stop', async (ctx) => {
+      const telegramId = ctx.from?.id?.toString();
+      if (!telegramId) {
+        return;
+      }
+      const cancelAnswer = this.cancelAnswerByTelegramId.get(telegramId);
+      if (cancelAnswer) {
+        cancelAnswer();
+      } else {
+        await this.telegramService.sendMessage('Нет активного ответа для остановки.', telegramId);
       }
     });
 
@@ -83,7 +106,7 @@ export class TelegramBotCommandService extends BaseService {
         if (trimmed === this.PROFILE_COMMAND) {
           await this.setState(telegramId, TelegramDialogStateEnum.PROFILE_WAIT_MODEL, {});
           await this.telegramService.sendMessage(
-            'Введите модель автомобиля (например, Toyota Camry):',
+            'Введите модель автомобиля (например, Амберавто А5):',
             telegramId,
             { reply_markup: this.getCancelKeyboard().reply_markup },
           );
@@ -102,30 +125,9 @@ export class TelegramBotCommandService extends BaseService {
           return;
         }
 
-        const result = await this.supportOrchestratorService.answerUserQuestion(user.telegramId, text);
-
-        const inlineKeyboard = result.historyId
-          ? Markup.inlineKeyboard([
-            [
-              Markup.button.callback('👍 Полезно', `fb:${result.historyId}:USEFUL`),
-              Markup.button.callback('👎 Не полезно', `fb:${result.historyId}:NOT_USEFUL`),
-            ],
-          ])
-          : undefined;
-
-        const isClarification = (result as { isClarification?: boolean }).isClarification;
-        const replyMarkup = isClarification
-          ? this.getCancelKeyboard().reply_markup
-          : inlineKeyboard?.reply_markup;
-        await this.telegramService.sendMessage(
-          result.answer,
-          user.telegramId,
-          replyMarkup ? { reply_markup: replyMarkup } : undefined,
+        this.scheduleSupportAnswerWithSpinner(user.telegramId, () =>
+          this.supportOrchestratorService.answerUserQuestion(user.telegramId, text),
         );
-
-        if (result.knowledgeIds?.length) {
-          await this.sendKnowledgeFiles(user.telegramId, result.knowledgeIds);
-        }
       } catch (err) {
         await this.sendErrorToUser(telegramId, err);
       }
@@ -310,10 +312,86 @@ export class TelegramBotCommandService extends BaseService {
       });
     });
 
+    bot.on('voice', async (ctx) => {
+      const user = await this.ensureUser(ctx);
+      const state = await this.getOrCreateState(user.telegramId);
+
+      const voice = ctx.message.voice;
+      if (!voice) {
+        return;
+      }
+
+      const fileId = voice.file_id;
+      const fileName = `voice_${voice.file_unique_id}.ogg`;
+      const mimeType = 'audio/ogg';
+
+      if (this.isAdmin(user) && state.state === TelegramDialogStateEnum.ADMIN_UPLOAD_WAIT_FILES) {
+        const data = state.data || {};
+        const pendingFileCount = (data.pendingFileCount ?? 0) + 1;
+        state.data = { ...data, pendingFileCount };
+        await state.save();
+
+        await this.telegramService.sendMessage(
+          'Обрабатываю голосовое сообщение… Кнопка «Готово» появится после загрузки.',
+          user.telegramId,
+          { reply_markup: this.getAdminFilesStepKeyboardWithoutDone().reply_markup },
+        );
+
+        this.processDocumentInBackground(fileId, fileName, mimeType, user).catch((err) => {
+          this.decrementPendingFileCountAndUpdateKeyboard(user.telegramId);
+          const wrapped = err instanceof Error
+            ? Object.assign(new Error(`Ошибка при сохранении голосового сообщения: ${err.message}`), { stack: err.stack })
+            : new Error(`Ошибка при сохранении голосового сообщения: ${String(err)}`);
+          return this.sendErrorToUser(user.telegramId, wrapped);
+        });
+        return;
+      }
+
+      try {
+        const telegram = this.telegramBotService.getBot().telegram;
+        const buffer = await this.downloadTelegramFileAsBuffer(telegram, fileId);
+        const transcription = await this.yandexVoiceRecognitionService.transcribeShortAudio(buffer);
+
+        if (!transcription.trim()) {
+          await this.telegramService.sendMessage(
+            'Не удалось распознать текст из голосового сообщения. Попробуйте ещё раз или отправьте текст.',
+            user.telegramId,
+          );
+          return;
+        }
+
+        this.scheduleSupportAnswerWithSpinner(user.telegramId, () =>
+          this.supportOrchestratorService.answerUserQuestion(user.telegramId, transcription),
+        );
+      } catch (err) {
+        if (err instanceof Error && err.message.includes('too large')) {
+          await this.telegramService.sendMessage(
+            'Голосовое сообщение слишком большое для распознавания. Попробуйте прислать более короткое голосовое или отправьте текст.',
+            user.telegramId,
+          );
+          return;
+        }
+
+        await this.sendErrorToUser(user.telegramId, 'Ошибка при распознавании голосового сообщения. Сообщение не должно превышать 30 секунд.');
+      }
+    });
+
     bot.on('callback_query', async (ctx) => {
       const user = await this.ensureUser(ctx);
 
       const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data ?? '' : '';
+
+      if (data.startsWith('stop:')) {
+        const targetTelegramId = data.slice('stop:'.length);
+        await ctx.answerCbQuery();
+        const cancelAnswer = this.cancelAnswerByTelegramId.get(targetTelegramId);
+        if (cancelAnswer) {
+          cancelAnswer();
+        } else {
+          await this.telegramService.sendMessage('Задача уже завершена или не найдена.', user.telegramId);
+        }
+        return;
+      }
 
       if (!data.startsWith('fb:')) {
         await ctx.answerCbQuery();
@@ -808,6 +886,26 @@ export class TelegramBotCommandService extends BaseService {
     return file.save();
   };
 
+  private downloadTelegramFileAsBuffer = async (
+    telegram: { getFileLink: (fileId: string) => Promise<{ toString(): string } | URL> },
+    fileId: string,
+  ): Promise<Buffer> => {
+    const link = await telegram.getFileLink(fileId);
+    const url = String(link);
+
+    const proxyAgent = this.telegramBotService.getSocksProxyAgent();
+    const axiosConfig = proxyAgent
+      ? {
+        httpAgent: proxyAgent,
+        httpsAgent: proxyAgent,
+        responseType: 'arraybuffer' as const,
+      }
+      : { responseType: 'arraybuffer' as const };
+
+    const response = await axios.get<ArrayBuffer>(url, axiosConfig);
+    return Buffer.from(response.data);
+  };
+
   private handleUserFileQuestion = async (
     user: UserEntity,
     payload: { fileId: string; fileName: string; mimeType: string; caption?: string | null },
@@ -837,13 +935,14 @@ export class TelegramBotCommandService extends BaseService {
 
     if (!hasCaption && !hasExtractedText) {
       if (imageBase64List?.length) {
-        const result = await this.supportOrchestratorService.answerUserQuestion(
-          user.telegramId,
-          '[Пользователь прикрепил фото]',
-          undefined,
-          imageBase64List,
+        this.scheduleSupportAnswerWithSpinner(user.telegramId, () =>
+          this.supportOrchestratorService.answerUserQuestion(
+            user.telegramId,
+            '[Пользователь прикрепил фото]',
+            undefined,
+            imageBase64List,
+          ),
         );
-        await this.sendSupportReply(user.telegramId, result);
         return;
       }
       await this.telegramService.sendMessage(
@@ -854,13 +953,14 @@ export class TelegramBotCommandService extends BaseService {
     }
 
     if (hasCaption && !hasExtractedText) {
-      const result = await this.supportOrchestratorService.answerUserQuestion(
-        user.telegramId,
-        caption,
-        undefined,
-        imageBase64List,
+      this.scheduleSupportAnswerWithSpinner(user.telegramId, () =>
+        this.supportOrchestratorService.answerUserQuestion(
+          user.telegramId,
+          caption,
+          undefined,
+          imageBase64List,
+        ),
       );
-      await this.sendSupportReply(user.telegramId, result);
       return;
     }
 
@@ -868,41 +968,128 @@ export class TelegramBotCommandService extends BaseService {
       ? caption
       : 'Проанализируй содержимое этого файла и объясни, что из него важно владельцу автомобиля.';
 
-    const result = await this.supportOrchestratorService.answerUserQuestion(
-      user.telegramId,
-      question,
-      [extractedText],
-      imageBase64List,
+    this.scheduleSupportAnswerWithSpinner(user.telegramId, () =>
+      this.supportOrchestratorService.answerUserQuestion(
+        user.telegramId,
+        question,
+        [extractedText],
+        imageBase64List,
+      ),
     );
-    await this.sendSupportReply(user.telegramId, result);
   };
 
-  private sendSupportReply = async (
+  /** Без await: иначе Telegraf не обработает следующий апдейт (/stop, callback) до конца ответа модели. */
+  private scheduleSupportAnswerWithSpinner = (
     telegramId: string,
-    result: { answer: string; historyId?: number; knowledgeIds?: number[]; isClarification?: boolean },
+    runAnswer: () => Promise<{
+      answer: string;
+      historyId?: number;
+      usedKnowledgeIds?: number[];
+      isClarification?: boolean;
+    }>,
+    spinnerBaseText = 'Готовлю ответ',
+  ): void => {
+    void this.deliverSupportAnswerWithSpinner(telegramId, runAnswer, spinnerBaseText).catch((err) => {
+      this.loggerService.error(this.TAG, 'scheduleSupportAnswerWithSpinner', err);
+      void this.sendErrorToUser(telegramId, err);
+    });
+  };
+
+  private deliverSupportAnswerWithSpinner = async (
+    telegramId: string,
+    runAnswer: () => Promise<{
+      answer: string;
+      historyId?: number;
+      usedKnowledgeIds?: number[];
+      isClarification?: boolean;
+    }>,
+    spinnerBaseText = 'Готовлю ответ',
   ): Promise<void> => {
-    const inlineKeyboard = result.historyId
-      ? Markup.inlineKeyboard([
-        [
-          Markup.button.callback('👍 Полезно', `fb:${result.historyId}:USEFUL`),
-          Markup.button.callback('👎 Не полезно', `fb:${result.historyId}:NOT_USEFUL`),
-        ],
-      ])
-      : undefined;
-
-    const replyMarkup = result.isClarification
-      ? this.getCancelKeyboard().reply_markup
-      : inlineKeyboard?.reply_markup;
-
-    await this.telegramService.sendMessage(
-      result.answer,
-      telegramId,
-      replyMarkup ? { reply_markup: replyMarkup } : undefined,
-    );
-
-    if (result.knowledgeIds?.length) {
-      await this.sendKnowledgeFiles(telegramId, result.knowledgeIds);
+    const spinner = await this.createSpinner(telegramId, spinnerBaseText);
+    let triggerCancelAnswer: () => void = () => undefined;
+    const cancelPromise = new Promise<never>((_, reject) => {
+      triggerCancelAnswer = () => reject(new Error('Cancelled'));
+    });
+    this.cancelAnswerByTelegramId.set(telegramId, triggerCancelAnswer);
+    try {
+      const result = await Promise.race([runAnswer(), cancelPromise]);
+      const inlineKeyboard = result.historyId
+        ? Markup.inlineKeyboard([
+          [
+            Markup.button.callback('👍 Полезно', `fb:${result.historyId}:USEFUL`),
+            Markup.button.callback('👎 Не полезно', `fb:${result.historyId}:NOT_USEFUL`),
+          ],
+        ])
+        : undefined;
+      const replyMarkup = result.isClarification
+        ? this.getCancelKeyboard().reply_markup
+        : inlineKeyboard?.reply_markup;
+      await spinner.finish(result.answer, replyMarkup);
+      const knowledgeIdList = result.usedKnowledgeIds ?? [];
+      if (knowledgeIdList.length) {
+        await this.sendKnowledgeFiles(telegramId, knowledgeIdList);
+      }
+    } catch (err) {
+      spinner.stop();
+      if (err instanceof Error && err.message === 'Cancelled') {
+        await spinner.finish(this.CANCELLED_ANSWER_MESSAGE);
+      } else {
+        await this.sendErrorToUser(telegramId, err);
+      }
+    } finally {
+      this.cancelAnswerByTelegramId.delete(telegramId);
     }
+  };
+
+  private createSpinner = async (telegramId: string, baseText: string) => {
+    let dotStep = 0;
+    let messageId: number | null = null;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const stopKeyboard = { inline_keyboard: [[{ text: '⛔ Остановить', callback_data: `stop:${telegramId}` }]] };
+
+    const renderText = () => `${DOTS[dotStep]} ${baseText}...`;
+
+    const sent = await this.telegramService
+      .sendMessage(renderText(), telegramId, { reply_markup: stopKeyboard } as any)
+      .catch(() => undefined);
+    messageId = sent?.message_id ?? null;
+
+    const updateText = async (newBase: string) => {
+      baseText = newBase;
+      if (messageId) {
+        await this.telegramService
+          .editMessage(renderText(), telegramId, messageId, { reply_markup: stopKeyboard } as any)
+          .catch(() => undefined);
+      }
+    };
+
+    if (messageId) {
+      timer = setInterval(async () => {
+        dotStep = (dotStep + 1) % DOTS.length;
+        await this.telegramService
+          .editMessage(renderText(), telegramId, messageId, { reply_markup: stopKeyboard } as any)
+          .catch(() => undefined);
+      }, 3000);
+    }
+
+    const stop = () => {
+      if (timer) {
+        clearInterval(timer); timer = null;
+      }
+    };
+
+    const finish = async (finalText: string, replyMarkup?: object) => {
+      stop();
+      if (messageId) {
+        await this.telegramService
+          .editMessage(finalText, telegramId, messageId, replyMarkup ? { reply_markup: replyMarkup } as any : undefined)
+          .catch(() => undefined);
+      } else {
+        await this.telegramService.sendMessage(finalText, telegramId, replyMarkup ? { reply_markup: replyMarkup } as any : undefined);
+      }
+    };
+
+    return { messageId, updateText, stop, finish };
   };
 }
 
