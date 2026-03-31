@@ -860,7 +860,7 @@ export class TelegramBotCommandService extends BaseService {
     const link = await telegram.getFileLink(fileId);
     const url = String(link);
 
-    const proxyAgent = this.telegramBotService.getSocksProxyAgent();
+    const proxyAgent = this.telegramBotService.getProxyAgent();
     const axiosConfig = proxyAgent
       ? {
         httpAgent: proxyAgent,
@@ -893,7 +893,7 @@ export class TelegramBotCommandService extends BaseService {
     const link = await telegram.getFileLink(fileId);
     const url = String(link);
 
-    const proxyAgent = this.telegramBotService.getSocksProxyAgent();
+    const proxyAgent = this.telegramBotService.getProxyAgent();
     const axiosConfig = proxyAgent
       ? {
         httpAgent: proxyAgent,
