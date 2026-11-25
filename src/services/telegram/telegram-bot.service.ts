@@ -15,7 +15,7 @@ export class TelegramBotService {
   private bot: Telegraf<Context> | null = null;
 
   private readonly proxyAgent: HttpsProxyAgent<any> | null = process.env.PROXY_USER && process.env.PROXY_PASS && process.env.PROXY_HOST
-    ? new HttpsProxyAgent(`http://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}`)
+    ? new HttpsProxyAgent(`https://${process.env.PROXY_USER}:${process.env.PROXY_PASS}@${process.env.PROXY_HOST}`)
     : null;
 
   /** Агент прокси для исходящих запросов к Telegram (например, загрузка файлов). null, если прокси не задан. */
